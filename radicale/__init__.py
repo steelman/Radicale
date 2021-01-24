@@ -53,6 +53,12 @@ import vobject
 
 from radicale import auth, config, log, rights, storage, web, xmlutils
 
+has_systemd = False
+try:
+    from systemd.daemon import listen_fds as sd_listen_fds
+    has_systemd = True
+except Exception:
+    pass
 
 VERSION = pkg_resources.get_distribution('radicale').version
 
@@ -154,7 +160,30 @@ class HTTPServer(wsgiref.simple_server.WSGIServer):
                               sys.exc_info()[1], exc_info=True)
 
 
-class HTTPSServer(HTTPServer):
+class SdHTTPServer(HTTPServer):
+    """HTTP Server started as a socket-activated systemd service."""
+    def __init__(self, address, handler, bind_and_activate):
+        super().__init__(address, handler, bind_and_activate=False)
+        self.socket_fromfd = False
+        if has_systemd:
+            sockets = sd_listen_fds()
+            if len(sockets) > 1:
+                raise RuntimeError("Too many inherited sockets: %d" % len(sockets))
+            elif len(sockets) == 1:
+                self.socket = socket.fromfd(sockets[0], self.address_family, self.socket_type)
+                self.server_address = self.socket.getsockname()
+                self.socket_fromfd = True
+
+    def server_bind(self):
+        """Override WSGIServer and HTTPServer"""
+        if not self.socket_fromfd:
+            socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = socket.getfqdn(host)
+        self.server_port = port
+        self.setup_environ()
+
+class HTTPSServer(SdHTTPServer):
     """HTTPS server."""
 
     # These class attributes must be set before creating instance
@@ -180,7 +209,7 @@ class HTTPSServer(HTTPServer):
         self.server_activate()
 
 
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, SdHTTPServer):
     def process_request_thread(self, request, client_address):
         with self.connections_guard:
             return super().process_request_thread(request, client_address)
